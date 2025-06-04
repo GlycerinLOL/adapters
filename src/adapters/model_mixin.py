@@ -4,6 +4,7 @@ import inspect
 import json
 import logging
 import os
+import warnings
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from copy import deepcopy
@@ -21,11 +22,11 @@ from transformers.modeling_outputs import ModelOutput
 from transformers.utils import is_accelerate_available
 
 from . import __version__
-from .composition import AdapterCompositionBlock, Fuse, Stack, parse_composition
+from .composition import AdapterCompositionBlock, Fuse, Stack, parse_composition, MoE
 from .configuration import ADAPTER_CONFIG_MAP, AdapterConfig, AdapterFusionConfig, BnConfig
 from .context import AdapterSetup, ForwardContext
 from .hub_mixin import PushAdapterToHubMixin
-from .loading import AdapterFusionLoader, AdapterLoader, PredictionHeadLoader, WeightsLoader
+from .loading import AdapterFusionLoader, AdapterLoader, PredictionHeadLoader, WeightsLoader, AdapterMoELoader
 from .methods.adapter_layer_base import AdapterLayerBase
 from .methods.bottleneck import BottleneckLayer
 from .methods.lora import LoRALayer
@@ -440,6 +441,7 @@ class ModelAdaptersMixin(PushAdapterToHubMixin, ABC):
         This method initializes adapter modules and fusion modules from the model config.
         """
         self.base_model.shared_parameters = nn.ModuleDict()
+        self.base_model.adapter_moe_layer = nn.ModuleDict(dict())
 
         # Initialize adapters config
         init_adapters_config(self, model_config, adapters_config)
@@ -503,12 +505,21 @@ class ModelAdaptersMixin(PushAdapterToHubMixin, ABC):
         self.train()
         self.freeze_model(True)
         adapter_setup = parse_composition(adapter_setup)
+        if isinstance(adapter_setup, AdapterCompositionBlock):
+            comp_name = ",".join(adapter_setup.children)
+        else:
+            comp_name = ",".join(adapter_setup)
         self.apply_to_adapter_layers(lambda i, layer: layer.enable_adapters(adapter_setup, True, False))
         self.apply_to_basemodel_childs(lambda i, child: child.enable_adapters(adapter_setup, True, False))
         for adapter_name in adapter_setup:
             if adapter_name in self.base_model.shared_parameters:
                 for param in self.base_model.shared_parameters[adapter_name].values():
                     param.requires_grad = True
+                    
+        if comp_name in self.adapter_moe_layer:
+            for param in self.adapter_moe_layer[comp_name].parameters():
+                param.requires_grad = True
+            print("[INFO] Adapter MoE gate {} is set to trainable.".format(comp_name))
 
         if isinstance(self, InvertibleAdaptersMixin) or isinstance(self, InvertibleAdaptersWrapperMixin):
             self.enable_invertible_adapters(adapter_setup.flatten())
@@ -525,6 +536,26 @@ class ModelAdaptersMixin(PushAdapterToHubMixin, ABC):
         adapter_setup = parse_composition(adapter_setup)
         self.apply_to_adapter_layers(lambda i, layer: layer.enable_adapters(adapter_setup, unfreeze_adapters, True))
         self.apply_to_basemodel_childs(lambda i, child: child.enable_adapters(adapter_setup, unfreeze_adapters, True))
+        # use the adapters to be trained by default in every forward pass
+        self.set_active_adapters(adapter_setup)
+        # TODO implement fusion for invertible adapters
+        
+    def train_adapter_moe(self, adapter_setup: Union[list, AdapterCompositionBlock], unfreeze_adapters=False):
+        """Sets the model into mode for training of adapter moe determined by a list of adapter names."""
+        self.train()
+        self.freeze_model(True)
+        adapter_setup = parse_composition(adapter_setup)
+        if isinstance(adapter_setup, AdapterCompositionBlock):
+            comp_name = ",".join(adapter_setup.children)
+        else:
+            comp_name = ",".join(adapter_setup)
+        self.apply_to_adapter_layers(lambda i, layer: layer.enable_adapters(adapter_setup, unfreeze_adapters, False, True))
+        self.apply_to_basemodel_childs(lambda i, child: child.enable_adapters(adapter_setup, unfreeze_adapters, False, True))
+        
+        if comp_name in self.adapter_moe_layer:
+            for param in self.adapter_moe_layer[comp_name].parameters():
+                param.requires_grad = True
+            print("[INFO] Adapter MoE gate {} is set to trainable.".format(comp_name))
         # use the adapters to be trained by default in every forward pass
         self.set_active_adapters(adapter_setup)
         # TODO implement fusion for invertible adapters
@@ -688,6 +719,58 @@ class ModelAdaptersMixin(PushAdapterToHubMixin, ABC):
         if set_active:
             self.set_active_adapters(Fuse(*adapter_names, name=name))
 
+    def add_moe_gate(
+        self,
+        adapter_names: Union[MoE, list, str],
+        config=None,
+        overwrite_ok: bool = False,
+        set_active: bool = False,
+    ):
+        """
+        Adds a Mixture of Experts gate to the specified adapter.
+
+        Args:
+            adapter_name (str): The name of the adapter to which the gate should be added.
+            num_experts (int): The number of experts in the gate.
+            hidden_size (int): The hidden size of the gate.
+            gate_bias (float, optional): The bias of the gate. Defaults to 0.0.
+        """
+        if isinstance(adapter_names, MoE):
+            moe_config = {
+                "num_experts": adapter_names.num_experts,
+                "top_k": adapter_names.top_k,
+                "jitter_noise": adapter_names.jitter_noise,
+                "shared_routing": adapter_names.shared_routing,
+                "leave_out": adapter_names.leave_out,
+            }
+            if config is not None:
+                if moe_config != config:
+                    raise ValueError(
+                        "The MoE configuration from the adapter name does not match the provided configuration."
+                    )
+            config = moe_config
+            adapter_names = adapter_names.children
+        elif isinstance(adapter_names, str):
+            adapter_names = adapter_names.split(",")
+            if config is None:
+                raise ValueError("The MoE configuration must be provided if the adapter names are given as a string.")
+        if config is not None:
+            print("[INFO] config is not None")
+        # if isinstance(config, dict):
+        #     raise NotImplementedError("Configuration for MoE gates is not yet supported.")
+        if overwrite_ok and self.adapters_config.get_MoE(adapter_names) is not None:
+            raise NotImplementedError("Overwriting MoE gates is not yet supported.")
+        # self.adapters_config.add_moe_gate(adapter_name, num_experts, hidden_size, gate_bias)
+        self.adapters_config.add_MoE(adapter_names, config=config)
+        if config["shared_routing"]:
+            gate = nn.Linear(self.config.hidden_size, len(adapter_names), bias=False)
+            gate.train(True)
+            self.base_model.adapter_moe_layer[",".join(adapter_names)] = gate
+            print("[INFO] Add shared routing gate on model class {}.".format(self.__class__.__name__))
+        else:
+            self.apply_to_adapter_layers(lambda i, layer: layer.add_gate_layer(adapter_names))
+            self.apply_to_basemodel_childs(lambda i, child: child.add_gate_layer(adapter_names))
+
     def delete_adapter(self, adapter_name: str):
         """
         Deletes the adapter with the specified name from the model.
@@ -799,6 +882,40 @@ class ModelAdaptersMixin(PushAdapterToHubMixin, ABC):
         if custom_weights_loaders:
             for weights_loader in custom_weights_loaders:
                 weights_loader.save(save_directory, adapter_fusion_name)
+                
+    def save_adapter_moe(
+        self,
+        save_directory: str,
+        adapter_names: Union[Fuse, list, str],
+        meta_dict: dict = None,
+        custom_weights_loaders: Optional[List[WeightsLoader]] = None,
+    ):
+        """
+        Saves an AdapterMoE layer and its configuration file to a directory so that it can be shared or reloaded
+        using `load_adapter_MoE()`.
+
+        Args:
+            save_directory (str): Path to a directory where the AdapterMoE should be saved.
+            adapter_names (Union[Fuse, list, str]): AdapterMoE to be saved.
+
+        Raises:
+            ValueError: If the given AdapterMoE name is invalid.
+        """
+        if isinstance(adapter_names, MoE):
+            adapter_moe_name = ",".join(adapter_names.children)
+        elif isinstance(adapter_names, list):
+            adapter_moe_name = ",".join(adapter_names)
+        elif isinstance(adapter_names, str):
+            adapter_moe_name = adapter_names
+        else:
+            raise ValueError("Invalid AdapterMoE definition: {}".format(adapter_names))
+
+        loader = AdapterMoELoader(self)
+        loader.save(save_directory, adapter_moe_name, meta_dict)
+        # save additional custom weights
+        if custom_weights_loaders:
+            for weights_loader in custom_weights_loaders:
+                weights_loader.save(save_directory, adapter_moe_name)
 
     def load_adapter(
         self,
@@ -899,6 +1016,44 @@ class ModelAdaptersMixin(PushAdapterToHubMixin, ABC):
                     set_active=set_active,
                 )
         return load_name
+    
+    def load_adapter_moe(
+        self,
+        adapter_moe_name_or_path: str,
+        load_as: str = None,
+        custom_weights_loaders: Optional[List[WeightsLoader]] = None,
+        set_active: bool = False,
+        **kwargs
+    ) -> str:
+        """
+        Loads a pre-trained AdapterFusion layer from the local file system.
+
+        Args:
+            adapter_fusion_name_or_path (str):
+                a path to a directory containing AdapterFusion weights saved using `model.save_adapter_fusion()`.
+            load_as (str, optional): Load the AdapterFusion using this name.
+                    By default, the name with which the AdapterFusion layer was saved will be used.
+            set_active (bool, optional):
+                Activate the loaded AdapterFusion. By default (False), the AdapterFusion is loaded but not activated.
+
+        Returns:
+            str: The name with which the AdapterFusion was added to the model.
+        """
+
+        loader = AdapterMoELoader(self)
+        load_dir, load_name = loader.load(adapter_moe_name_or_path, load_as, set_active=set_active)
+        # load additional custom weights
+        if custom_weights_loaders:
+            for weights_loader in custom_weights_loaders:
+                weights_loader.load(
+                    load_dir,
+                    load_as=load_as,
+                    loading_info=kwargs.get("loading_info", None),
+                    main_load_name=load_name,
+                    set_active=set_active,
+                )
+        return load_name
+
 
     def _save_adapter_setup_config(
         self,
@@ -1117,6 +1272,33 @@ class ModelAdaptersMixin(PushAdapterToHubMixin, ABC):
                 custom_weights_loaders=custom_weights_loaders,
                 use_safetensors=use_safetensors,
             )
+            
+    def save_all_adapter_moe(
+        self,
+        save_directory: str,
+        meta_dict: dict = None,
+        custom_weights_loaders: Optional[List[WeightsLoader]] = None,
+    ):
+        """
+        Saves all AdapterFusion layers of this model together with their configuration to subfolders of the given
+        location.
+
+        Args:
+            save_directory (str): Path to a directory where the AdapterFusion layers should be saved.
+        """
+        os.makedirs(save_directory, exist_ok=True)
+        for name in self.adapters_config.MoEs:
+            adapter_moe_config = self.adapters_config.get_MoE(name)
+            # h = get_adapter_config_hash(adapter_moe_config)
+            save_path = join(save_directory, name)
+            # if meta_dict:
+            #     meta_dict.update({"config_id": h})
+            # else:
+            #     meta_dict = {"config_id": h}
+            meta_dict = None
+            self.save_adapter_moe(
+                save_path, name, meta_dict=meta_dict, custom_weights_loaders=custom_weights_loaders
+            )
 
     def freeze_model(self, freeze=True):
         """Freezes all weights of the model."""
@@ -1148,6 +1330,8 @@ class ModelAdaptersMixin(PushAdapterToHubMixin, ABC):
             for name, param in self.base_model.shared_parameters.items()
             if name in active_adapters.flatten()
         }
+        
+        context.adapter_moe_layer = kwargs.pop("adapter_moe_layer", None)
 
         if hasattr(self.base_model, "prefix_tuning"):
             context.prefix_states = self.base_model.prefix_tuning(*args, **kwargs)
@@ -1169,6 +1353,8 @@ class ModelAdaptersMixin(PushAdapterToHubMixin, ABC):
         context.output_adapter_fusion_attentions = kwargs.get("output_adapter_fusion_attentions", False)
         context.adapter_gating_scores = defaultdict(dict)
         context.adapter_fusion_attentions = defaultdict(dict)
+        context.adapter_router_logits = ()
+        context.adapter_remaining_gating_scores = []
 
     def get_fusion_regularization_loss(self):
         reg_loss = None
@@ -1212,7 +1398,7 @@ class ModelAdaptersMixin(PushAdapterToHubMixin, ABC):
             prompt_tuning = self.prompt_tuning.get_adapter(name)
             if prompt_tuning is not None:
                 destination[-1]["prompt"] = prompt_tuning
-
+                
         # use a custom index to ensure numbering is from 0 to N layers
         for i, (_, layer) in enumerate(self.iter_layers()):
             for module in layer.modules():
@@ -1266,6 +1452,74 @@ class ModelAdaptersMixin(PushAdapterToHubMixin, ABC):
                     fusion = module.get_adapter_fusion(adapter_names)
                     if fusion is not None:
                         fusion.to(device=device, dtype=dtype)
+                        
+    def adapter_moe_to(
+        self,
+        adapter_names: Union[Fuse, list, str],
+        device: Optional[Union[torch.device, str]] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        """_summary_
+
+        Args:
+            adapter_names (Union[Fuse, list, str]): _description_
+            device (Optional[Union[torch.device, str]], optional): _description_. Defaults to None.
+            dtype (Optional[torch.dtype], optional): _description_. Defaults to None.
+        """
+        
+        for _, layer in self.iter_layers():
+            for module in layer.modules():
+                if isinstance(module, BottleneckLayer):
+                    moe = module.get_MoE(adapter_names)
+                    if moe is not None:
+                        for _, module in moe.items():
+                            module.to(device=device, dtype=dtype)
+
+    def get_MoE(self, name) -> dict:
+        """
+        Returns a dictionary with all weights of the adapter with the specified name.
+
+        Args:
+            name (str): The adapter name.
+
+        Returns:
+            dict: A nested dictionary containing the weights of the adapter. The dictionary is structured as follow:
+            {<layer id>: {<module location>: <nn.Module>}}. <layer id> = -1 indicates global/ shared weights.
+        """
+        destination = defaultdict(dict)
+        
+        if self.base_model.adapter_moe_layer is not None and name in self.base_model.adapter_moe_layer:
+            destination[-1][self.base_model.__class__.__name__] = self.base_model.adapter_moe_layer[name]
+
+        # use a custom index to ensure numbering is from 0 to N layers
+        for i, (_, layer) in enumerate(self.iter_layers()):
+            for module in layer.modules():
+                if isinstance(module, BottleneckLayer):
+                    adapter_module = module.get_MoE(name)
+                    if adapter_module is not None:
+                        # location_key might already be added before -> concat to ModuleList
+                        if module.location_key in destination[i]:
+                            old_module = destination[i][module.location_key]
+                            if isinstance(old_module, nn.ModuleList):
+                                old_module.append(adapter_module)
+                            else:
+                                destination[i][module.location_key] = nn.ModuleList([old_module, adapter_module])
+                        else:
+                            destination[i][module.location_key] = adapter_module
+
+        return dict(destination)
+    
+    def get_token_distribution(self) -> dict:
+        
+        token_distribution = defaultdict(dict)
+        for i, (_, layer) in enumerate(self.iter_layers()):
+            for module in layer.modules():
+                if isinstance(module, BottleneckLayer):
+                    adapter_ratio = module.get_token_distribution()
+                    if len(adapter_ratio) > 0:
+                        token_distribution[f"layer_{i}_dist"] = adapter_ratio
+        return dict(token_distribution)
+                    
 
     def adapter_summary(self, as_dict=False) -> Union[str, dict]:
         """
@@ -1294,6 +1548,37 @@ class ModelAdaptersMixin(PushAdapterToHubMixin, ABC):
             row = {"name": name, "architecture": config.get("architecture", None) or "bottleneck"}
             weights = self.get_adapter(name)
             row["active"] = self.active_adapters is not None and name in self.active_adapters.flatten()
+            # count parameters
+            no_params = 0
+            train = True
+            for _, module_dict in weights.items():
+                for _, module in module_dict.items():
+                    no_params += sum(p.numel() for p in module.parameters())
+                    train &= all(p.requires_grad for p in module.parameters())
+            row["#param"] = no_params
+            row["train"] = train
+            rows.append(row)
+        # fill in data for adapter fusions
+        for name, config in self.adapters_config.fusions.items():
+            row = {"name": name, "architecture": "fusion"}
+            weights = self.get_adapter(name)
+            row["active"] = True
+            # count parameters
+            no_params = 0
+            train = True
+            for _, module_dict in weights.items():
+                for _, module in module_dict.items():
+                    no_params += sum(p.numel() for p in module.parameters())
+                    train &= all(p.requires_grad for p in module.parameters())
+            row["#param"] = no_params
+            row["train"] = train
+            rows.append(row)
+        # fill in data for adapter MoEs
+        for name, config in self.adapters_config.MoEs.items():
+            num_experts = len(name.split(",")) if isinstance(name, str) else len(name)
+            row = {"name": f"MoE_{num_experts}_adapters", "architecture": "MoE"}
+            weights = self.get_MoE(name)
+            row["active"] = True
             # count parameters
             no_params = 0
             train = True
@@ -1555,6 +1840,7 @@ class ModelAdaptersMixin(PushAdapterToHubMixin, ABC):
             for argument, value in model_kwargs.items()
             if not any(argument.startswith(p) for p in irrelevant_prefix)
         }
+
         encoder_signature = set(inspect.signature(encoder.forward).parameters)
         encoder_accepts_wildcard = "kwargs" in encoder_signature or "model_kwargs" in encoder_signature
         if not encoder_accepts_wildcard:
@@ -1810,6 +2096,17 @@ class ModelWithHeadsAdaptersMixin(ModelAdaptersMixin):
             super().train_adapter_fusion(adapter_setup, unfreeze_adapters=unfreeze_adapters)
         else:
             self.base_model.train_adapter_fusion(adapter_setup, unfreeze_adapters=unfreeze_adapters)
+        self.freeze_embeddings()
+        
+    def train_adapter_moe(self, adapter_setup: Union[list, AdapterCompositionBlock], unfreeze_adapters=False):
+        """
+        Sets the model into mode for training of adapter fusion determined by a list of adapter names. If
+        self.base_model is self, must inherit from a class that implements this method, to preclude infinite recursion
+        """
+        if self.base_model is self:
+            super().train_adapter_moe(adapter_setup, unfreeze_adapters=unfreeze_adapters)
+        else:
+            self.base_model.train_adapter_moe(adapter_setup, unfreeze_adapters=unfreeze_adapters)
         self.freeze_embeddings()
 
     def average_head(

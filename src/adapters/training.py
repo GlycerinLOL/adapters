@@ -31,6 +31,10 @@ class AdapterArguments:
     lang_adapter_config: Optional[str] = field(
         default=None, metadata={"help": "Language adapter configuration. Either an identifier or a path to a file."}
     )
+    data_type: Optional[str] = field(
+        default="Normal",
+        metadata={"help": "The type of data to be processed"},
+    )
 
 
 def setup_adapter_training(

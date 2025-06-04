@@ -83,6 +83,9 @@ class ForwardContext(ContextManager):
         "adapter_gating_scores",
         "adapter_fusion_attentions",
         "adapter_input_parallelized",
+        "adapter_moe_layer",
+        "adapter_router_logits",
+        "adapter_remaining_gating_scores",
     ]
     # Additional used attributes not exposed to the user
     # - prompt_tokens_length: length of the prompt tokens

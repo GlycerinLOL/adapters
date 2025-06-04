@@ -19,7 +19,7 @@ from transformers.trainer_utils import EvalPrediction
 from transformers.training_args import TrainingArguments
 from transformers.utils import CONFIG_NAME, WEIGHTS_NAME, is_datasets_available, is_sagemaker_mp_enabled, logging
 
-from .composition import AdapterCompositionBlock, Fuse
+from .composition import AdapterCompositionBlock, Fuse, MoE
 
 
 if is_datasets_available():
@@ -72,6 +72,17 @@ class AdapterTrainer(Trainer):
         )
         if model is not None:
             model.is_quantized = model_quantized
+            
+        for name, hash in model.adapters_config.adapters.items():
+            adapter_config = model.adapters_config.config_map[hash]
+            if adapter_config.use_gating or adapter_config.gate_scaling:
+                self.output_adapter_gating_scores = True
+                self.adapter_gating_scores = {
+                    "parallel": {f"output_adapter.{i}": [] for i in range(model.config.num_hidden_layers)},
+                }
+                break
+            else:
+                self.output_adapter_gating_scores = False
 
         if adapter_names is not None:
             self.model.set_active_adapters(adapter_names)
@@ -87,6 +98,13 @@ class AdapterTrainer(Trainer):
                 or isinstance(self.model.active_adapters, AdapterCompositionBlock)
                 and any([isinstance(child, Fuse) for child in self.model.active_adapters.children])
             )
+            # Check if training MoE
+            self.train_adapter_moe = (
+                isinstance(self.model.active_adapters, MoE)
+                or isinstance(self.model.active_adapters, AdapterCompositionBlock)
+                and any([isinstance(child, MoE) for child in self.model.active_adapters.children])
+            )
+            
         if self.model.active_adapters is None:
             raise ValueError(
                 "Expected a model with an active adapter setup."
@@ -156,6 +174,8 @@ class AdapterTrainer(Trainer):
             self.model.save_all_adapters(output_dir)
             if self.train_adapter_fusion:
                 self.model.save_all_adapter_fusions(output_dir)
+            if self.train_adapter_moe:
+                self.model.save_all_adapter_moe(output_dir)
             if hasattr(self.model, "heads"):
                 self.model.save_all_heads(output_dir)
         if self.tokenizer is not None:
@@ -241,6 +261,18 @@ class AdapterTrainer(Trainer):
                 if os.path.exists(fusion_dir):
                     model.load_adapter_fusion(fusion_dir)
                     model.adapter_fusion_to(fusion, device=self.args.device)
+                    
+        if self.train_adapter_moe:
+            logger.info(
+                f"Loading best adapter MoE(s) from {self.state.best_model_checkpoint} (score:"
+                f" {self.state.best_metric})."
+            )
+            # attempt to re-load all adapter MoEs from checkpoint
+            for moe in model.adapters_config.MoEs:
+                moe_dir = os.path.join(self.state.best_model_checkpoint, moe)
+                if os.path.exists(moe_dir):
+                    model.load_adapter_moe(moe_dir)
+                    model.adapter_moe_to(moe, device=self.args.device)
 
 
 class AdapterTrainerCallback(TrainerCallback):

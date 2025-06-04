@@ -167,6 +167,10 @@ class BnConfig(AdapterConfig):
         use_gating (:obj:`bool`, optional):
             Place a trainable gating module besides the added parameter module to control module activation. This is
             e.g. used for UniPELT. Defaults to False.
+        gate_scaling (:obj:`bool` or :obj:`str`, optional):
+            Place a trainable gate after the adapter module to control the scaling of the adapter output. If set to
+            True, input of the gate is the adapter output and the MLP output. If set to "down_prj", input ofthe gate 
+            is the output of the down projection layer and the MLP output. Defaults to False.
         residual_before_ln (:obj:`bool` or :obj:`str`, optional):
             If True, take the residual connection around the adapter bottleneck before the layer normalization. If set
             to "post_add", take the residual connection around the adapter bottleneck after the previous residual
@@ -235,7 +239,11 @@ class BnConfig(AdapterConfig):
     init_weights: str = "bert"
     is_parallel: bool = False
     scaling: Union[float, str] = 1.0
-    use_gating: bool = False
+    
+    gate_scaling: Union[bool, str] = False
+    use_gating: Union[bool, str] = False
+    max_gating: Optional[bool] = False
+    
     residual_before_ln: Union[bool, str] = True
     adapter_residual_before_ln: bool = False
     inv_adapter: Optional[str] = None
@@ -368,6 +376,8 @@ class ParBnConfig(BnConfig):
     init_weights: str = "mam_adapter"
     is_parallel: bool = True
     scaling: Union[float, str] = 4.0
+    gate_scaling: Union[bool, str] = False
+    max_gating: Optional[bool] = False
 
 
 @dataclass(eq=False)

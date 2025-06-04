@@ -22,6 +22,8 @@ from .utils import (
     ACTIVATION_RENAME,
     ADAPTERFUSION_CONFIG_NAME,
     ADAPTERFUSION_WEIGHTS_NAME,
+    ADAPTERMOE_CONFIG_NAME,
+    ADAPTERMOE_WEIGHTS_NAME,
     CONFIG_NAME,
     HEAD_CONFIG_NAME,
     HEAD_WEIGHTS_NAME,
@@ -351,6 +353,7 @@ class AdapterLoader(WeightsLoader):
             or ".loras.{}.".format(adapter_name) in x
             or ".refts.{}.".format(adapter_name) in x
             or ".prompt_tunings.{}.".format(adapter_name) in x
+            or ".adapter_scaling_gate" in x
         )
 
     # This dict maps the original weight names to the currently used equivalents.
@@ -770,6 +773,105 @@ class AdapterFusionLoader(WeightsLoader):
         )
 
         return save_directory, adapter_fusion_name
+    
+
+class AdapterMoELoader(WeightsLoader):
+    """
+    A class providing methods for saving and loading AdapterMoE modules from the file system.
+
+    """
+
+    def __init__(self, model, error_on_missing=True):
+        super().__init__(model, ADAPTERMOE_WEIGHTS_NAME, ADAPTERMOE_CONFIG_NAME)
+        self.error_on_missing = error_on_missing
+
+    def filter_func(self, adapter_fusion_name):
+        return lambda x: "adapter_moe_layer.{}".format(adapter_fusion_name) in x
+
+    def rename_func(self, old_name, new_name):
+        return lambda k: k.replace(
+            "adapter_moe_layer.{}".format(old_name), "adapter_moe_layer.{}".format(new_name)
+        )
+
+    def save(self, save_directory: str, name: str, meta_dict=None):
+        """
+        Saves a AdapterMoE module into the given directory.
+
+        Args:
+            save_directory (str): The directory to save the weights in.
+            name (str, optional): The AdapterFusion name.
+        """
+
+        if name not in self.model.adapters_config.MoEs:
+            if self.error_on_missing:
+                raise ValueError(f"Unknown Adapter MoE '{name}'.")
+            else:
+                logger.debug(f"No Adapter MoE with name '{name}' available.")
+                return
+
+        if not exists(save_directory):
+            mkdir(save_directory)
+        else:
+            assert isdir(save_directory), "Saving path should be a directory where the head can be saved."
+
+        adapter_fusion_config = self.model.adapters_config.get_MoE(name)
+
+        # Save the adapter fusion configuration
+        config_dict = build_full_config(
+            adapter_fusion_config,
+            self.model.config,
+            name=name,
+            model_name=self.model.model_name,
+            model_class=self.model.__class__.__name__,
+        )
+        self.weights_helper.save_weights_config(save_directory, config_dict, meta_dict=meta_dict)
+
+        # Save head weights
+        filter_func = self.filter_func(name)
+        self.weights_helper.save_weights(save_directory, filter_func)
+
+    def load(self, save_directory, load_as=None, loading_info=None, **kwargs):
+        """
+        Loads a AdapterMoE module from the given directory.
+
+        Args:
+            save_directory (str): The directory from where to load the weights.
+            load_as (str, optional): Load the weights with this name. Defaults to None.
+
+        Returns:
+            Tuple[str, str]: A tuple consisting of the local file system directory from which the weights where loaded
+            and the name of the loaded weights.
+        """
+        if not exists(join(save_directory, ADAPTERMOE_WEIGHTS_NAME)):
+            if self.error_on_missing:
+                raise ValueError("Loading path should be a directory where AdapterMoE is saved.")
+            else:
+                logger.debug("No matching adapter moe found in '{}'".format(save_directory))
+                return None, None
+
+        config = self.weights_helper.load_weights_config(save_directory)
+
+        adapter_moe_name = load_as or config["name"]
+        if adapter_moe_name not in self.model.adapters_config.MoEs:
+            print(f"[INFO] Loading Adapter MoE {adapter_moe_name}")
+            print(f"[INFO] Adapter MoE config {config['config']}")
+            self.model.add_moe_gate(
+                adapter_moe_name, config["config"], overwrite_ok=True, set_active=kwargs.pop("set_active", True)
+            )
+        else:
+            logger.warning("Overwriting existing adapter moe module '{}'".format(adapter_moe_name))
+
+        # Load AdapterMoE weights
+        filter_func = self.filter_func(adapter_moe_name)
+        if load_as:
+            rename_func = self.rename_func(config["name"], load_as)
+        else:
+            rename_func = None
+        self.weights_helper.load_weights(
+            save_directory, filter_func, rename_func=rename_func, loading_info=loading_info
+        )
+
+        return save_directory, adapter_moe_name   
 
 
 class PredictionHeadLoader(WeightsLoader):

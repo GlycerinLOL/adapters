@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from ..composition import ALLOWED_NESTINGS, AdapterCompositionBlock, Average, BatchSplit, Fuse, Parallel, Split, Stack
+from ..composition import ALLOWED_NESTINGS, AdapterCompositionBlock, Average, BatchSplit, Fuse, Parallel, Split, Stack, MoE
 from ..context import AdapterSetup, ForwardContext
 
 
@@ -75,6 +75,10 @@ class AdapterLayerBase(metaclass=ABCMeta):
             if self.layer_idx not in attention_cache[fusion_name]:
                 attention_cache[fusion_name][self.layer_idx] = {}
             attention_cache[fusion_name][self.layer_idx][self.location_key] = attentions
+            
+    def _store_router_logits(self,  router_logits):
+        context = ForwardContext.get_context()        
+        context.adapter_router_logits += (router_logits,)
 
     @abstractmethod
     def add_adapter(self, adapter_name: str, layer_idx: int) -> bool:
@@ -144,6 +148,12 @@ class AdapterLayerBase(metaclass=ABCMeta):
     def delete_fusion_layer(self, adapter_names: Union[List, str]):
         pass  # default implementation does nothing as fusion is not applicable to all methods
 
+    def add_gate_layer(self, adapter_names: Union[List, str]):
+        pass  # default implementation does nothing as gating is not applicable to all methods
+
+    def delete_gate_layer(self, adapter_names: Union[List, str]):
+        pass # default implementation does nothing as gating is not applicable to all methods
+    
     def enable_adapters(self, adapter_setup: AdapterCompositionBlock, unfreeze_adapters: bool, unfreeze_fusion: bool):
         """Enables/ disables a set of adapter modules within the layer.
 
@@ -212,6 +222,7 @@ class ComposableAdapterLayerBase(AdapterLayerBase):
             BatchSplit: "compose_batch_split",
             Parallel: "compose_parallel",
             Average: "compose_average",
+            MoE: "compose_moe",
         }
 
     def _get_compose_func(self, composition_type: type) -> callable:
@@ -357,6 +368,13 @@ class ComposableAdapterLayerBase(AdapterLayerBase):
 
         return state
 
+    def compose_moe(self, adapter_setup: MoE, state: NamedTuple, lvl: int = 0):
+        """
+        For fusing multiple adapters using mixture of experts. NOTE: This method has no default implementation.
+        """
+        # MoE is currently only applicable to bottleneck adapters, thus don't provide a default implementation
+        raise NotImplementedError()
+
     def compose_fuse(self, adapter_setup: Fuse, state: NamedTuple, lvl: int = 0):
         """
         For fusing multiple adapters using adapter fusion. NOTE: This method has no default implementation.
@@ -500,7 +518,7 @@ class ComposableAdapterLayerBase(AdapterLayerBase):
                 pass
 
         weights = torch.tensor(adapter_setup.weights)[:, None, None, None].to(state[0].device)
-        state = self.mean(children_states, weights)
+        state = self.mean(children_states, weights.to(dtype=state[0].dtype))
 
         return state
 

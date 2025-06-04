@@ -2,8 +2,9 @@ import logging
 from typing import Optional
 
 import torch
+from torch import nn
 
-from transformers.generation import GenerationMixin
+# from transformers.generation import GenerationMixin
 from transformers.models.llama.modeling_llama import LLAMA_START_DOCSTRING, LlamaModel, LlamaPreTrainedModel
 from transformers.utils import add_start_docstrings
 
@@ -11,6 +12,7 @@ from ...composition import adjust_tensors_for_parallel
 from ...heads import ModelWithFlexibleHeadsAdaptersMixin
 from ...model_mixin import EmbeddingAdaptersWrapperMixin
 from ...wrappers import init
+from ...generation_utils import AdapterGenerationMixin as GenerationMixin
 
 
 logger = logging.getLogger(__name__)
@@ -50,6 +52,7 @@ class LlamaAdapterModel(
         # Model parallel
         self.model_parallel = False
         self.device_map = None
+        # self.adapter_moe_layer = nn.ModuleDict(dict())
         self.post_init()
 
     def forward(
@@ -89,10 +92,12 @@ class LlamaAdapterModel(
             output_adapter_gating_scores=output_adapter_gating_scores,
             output_adapter_fusion_attentions=output_adapter_fusion_attentions,
             adapter_input_parallelized=kwargs.pop("adapter_input_parallelized", False),
+            adapter_moe_layer=self.base_model.adapter_moe_layer,
             output_context=True,
         )
         # required e.g. for prompt tuning in all models
         kwargs["context"] = context
+        kwargs["moe_config"] = self.adapters_config.active_setup
 
         batch_size = outputs[0].shape[0]
 
@@ -142,7 +147,7 @@ class LlamaAdapterModel(
             model_inputs = {"inputs_embeds": inputs_embeds}
         else:
             model_inputs = {"input_ids": input_ids}
-
+            
         model_inputs.update(
             {
                 "position_ids": position_ids,
@@ -150,6 +155,7 @@ class LlamaAdapterModel(
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
                 "adapter_input_parallelized": kwargs.pop("adapter_input_parallelized", False),
+                "output_adapter_gating_scores": kwargs.pop("output_adapter_gating_scores", False),
             }
         )
         return model_inputs

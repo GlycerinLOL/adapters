@@ -586,8 +586,11 @@ class ModelWithFlexibleHeadsAdaptersMixin(ModelWithHeadsAdaptersMixin):
         # Set prompt tokens length
         if context is not None:
             prompt_tokens_length = context.get("prompt_tokens_length", None)
+            router_logits = context.get("adapter_router_logits", None)
             if prompt_tokens_length is not None:
                 kwargs["prompt_tokens_length"] = prompt_tokens_length
+            if router_logits is not None:
+                kwargs["adapter_router_logits"] = router_logits
 
         if isinstance(self.active_head, BatchSplit):
             if sum(self.active_head.batch_sizes) != all_outputs[0].size()[0]:

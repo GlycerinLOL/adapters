@@ -28,6 +28,8 @@ class ModelAdaptersConfig(Collection):
         self.fusions: Mapping[str, str] = kwargs.pop("fusions", {})
         self.fusion_config_map = kwargs.pop("fusion_config_map", {})
         self.fusion_name_map = kwargs.pop("fusion_name_map", {})
+        self.MoEs: Mapping[str, str] = kwargs.pop("MoEs", {})
+        self.MoE_config_map = kwargs.pop("MoE_config_map", {})
 
         # TODO-V2 Save this with config?
         self.active_setup: Optional[AdapterCompositionBlock] = None
@@ -192,6 +194,40 @@ class ModelAdaptersConfig(Collection):
             raise ValueError("Invalid AdapterFusion config: {}".format(config))
         self.fusions[fusion_name] = config_name
         logger.info(f"Adding AdapterFusion '{fusion_name}'.")
+        
+    def get_MoE(self, MoE_name: Union[str, List[str]]) -> Optional[dict]:
+        if isinstance(MoE_name, list):
+            MoE_name = ",".join(MoE_name)
+        if MoE_name in self.MoEs:
+            config_name = self.MoEs[MoE_name]
+            if config_name in self.MoE_config_map:
+                config = self.MoE_config_map.get(config_name, None)
+            else:
+                raise ValueError(f"MoE config '{config_name}' not found.")
+        else:
+            config = None
+        return config
+    
+    def add_MoE(self, MoE_name: Union[str, List[str]], config: Optional[Union[str, dict]] = None):
+        if isinstance(MoE_name, list):
+            num_experts = len(MoE_name)
+            MoE_name = ",".join(MoE_name)
+        if MoE_name in self.MoEs:
+            raise ValueError(f"An MoE with the name '{MoE_name}' has already been added.")
+        if config is None:
+            config = {
+                "num_experts": num_experts,
+                "top_k": 1,
+                "jitter_noise": 0,
+                "shared_routing": False,
+            }
+        if isinstance(config, Mapping):
+            config_name = get_adapter_config_hash(config)
+            self.MoE_config_map[config_name] = config
+        else:
+            raise ValueError("Invalid MoE config: {}".format(config))
+        self.MoEs[MoE_name] = config_name
+        logger.info(f"Adding MoE '{MoE_name}'.")
 
     def common_config_value(self, adapter_names: list, attribute: str):
         """

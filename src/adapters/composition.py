@@ -3,6 +3,7 @@ import sys
 import warnings
 from collections.abc import Sequence
 from typing import List, Optional, Set, Tuple, Union
+from torch import nn
 
 import torch
 
@@ -144,6 +145,30 @@ class Average(AdapterCompositionBlock):
     def _get_save_kwargs(self):
         return {"weights": self.weights}
 
+    
+class MoE(AdapterCompositionBlock):
+    def __init__(self, *moe_adapters: List[Union[AdapterCompositionBlock, str]], config: dict):
+        super().__init__(*moe_adapters)
+        self.config = config
+        self.num_experts = config.get("num_experts", 1)
+        self.jitter_noise = config.get("jitter_noise", 0)
+        self.top_k = config.get("top_k", 1)
+        self.layer_name = f"moe_{self.num_experts}_adapters_{self.num_experts}{self.top_k}{self.jitter_noise}"
+        self.shared_routing = config.get("shared_routing", False)
+        self.mode = config.get("mode", "top_k")
+        self.lb_loss = config.get("lb_loss", False)
+        self.lb_loss_weight = config.get("lb_loss_weight", 0.01)
+        self.lb_bias = config.get("lb_bias", False)
+        self.leave_out = config.get("leave_out", None)
+        self.single_decision = config.get("single_decision", False)
+        self.shared_expert = config.get("shared_expert", False)
+
+    @property
+    def name(self):
+        return ",".join([c if isinstance(c, str) else c.last() for c in self.children])
+
+    def _get_save_kwargs(self):
+        return {k: self.config[k] for k in self.config}
 
 # Mapping each composition block type to the allowed nested types
 ALLOWED_NESTINGS = {
@@ -153,6 +178,7 @@ ALLOWED_NESTINGS = {
     Parallel: [str, Stack, BatchSplit, Average],
     BatchSplit: [str, Stack, Split, BatchSplit, Average],
     Average: [str, Stack, Split, BatchSplit],
+    MoE: [str, Stack],
 }
 
 # Some composition blocks might not be supported by all models.

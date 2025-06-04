@@ -46,6 +46,7 @@ class Adapter(nn.Module):
         super().__init__()
         self.name = adapter_name
         self.input_size = input_size
+        self.config = config
         self.add_layer_norm_before = config["ln_before"]
         self.add_layer_norm_after = config["ln_after"]
         self.adapter_residual_before_ln = config["adapter_residual_before_ln"]
@@ -111,7 +112,11 @@ class Adapter(nn.Module):
             self.adapter_norm_after = nn.LayerNorm(self.input_size)
 
         if self.use_gating:
-            self.gate = nn.Linear(self.input_size, 1)
+            if self.use_gating == "down":
+                print(f"[INFO] Using gating on down projection of {self.name}")
+                self.gate = nn.Linear(self.down_sample, 1)
+            else:
+                self.gate = nn.Linear(self.input_size, 1)
 
         self.dropout = nn.Dropout(p=config["dropout"])
 
@@ -224,7 +229,7 @@ class Adapter(nn.Module):
             return output, down, up, gate
         return output, down, up
 
-    def post_forward(self, hidden_states, input_hidden_states, input_tensor, layer_norm):
+    def post_forward(self, hidden_states, input_hidden_states, input_tensor, layer_norm, **kwargs):
         """
         Performs computations after the forward pass of the adapter block(s). This e.g. includes applying the residual
         connection and layer norm if configured in this way.
@@ -297,13 +302,29 @@ class ParallelAdapter(Adapter):
 
         up = self.adapter_up(down)
         up = up * self.scaling
-
         output = self.dropout(up)
 
         if self.use_gating:
+            context = ForwardContext.get_context()
+            # act_fn = torch.sigmoid
+            act_fn = torch.nn.Softplus()
             # x.shape = (batch_size, seq_len, hidden_size)
-            gate = torch.sigmoid(self.gate(x))
-            gate = torch.mean(gate, dim=1).unsqueeze(-1)
+            if self.use_gating == "down":
+                gate = act_fn(self.gate(down))
+            else:
+                gate = act_fn(self.gate(x))
+            # gate = torch.mean(gate, dim=1).unsqueeze(-1)
+            # if not self.training:
+            #     print(f"Gate: {gate.mean():.3f}")
+            if self.config.max_gating:
+                if context.adapter_remaining_gating_scores:
+                    prev_remaining = context.adapter_remaining_gating_scores[-1]
+                else:
+                    prev_remaining = torch.tensor(8.0, device=gate.device, dtype=gate.dtype).expand_as(gate)
+                valid_mask = (prev_remaining - gate) >= 0.0
+                gate = gate * valid_mask.to(dtype=gate.dtype)
+                new_remaining = (prev_remaining - gate).clamp(min=0.0).detach()
+                context.adapter_remaining_gating_scores.append(new_remaining)   
             output = output * gate
 
         # apply layer norm if available
@@ -314,7 +335,7 @@ class ParallelAdapter(Adapter):
             return output, down, up, gate
         return output, down, up
 
-    def post_forward(self, hidden_states, input_hidden_states, input_tensor, layer_norm):
+    def post_forward(self, hidden_states, input_hidden_states, input_tensor, layer_norm, **kwargs):
         """
         Performs computations after the forward pass of the adapter block(s). This e.g. includes applying the residual
         connection and layer norm if configured in this way.
@@ -328,7 +349,34 @@ class ParallelAdapter(Adapter):
         Returns:
             The modified hidden states.
         """
-        hidden_states = hidden_states + input_hidden_states
+        scaling_gate = kwargs.get("scaling_gate", None)
+        down = kwargs.get("down", None)
+        store_gating_func = kwargs.get("store_gating_func", None)
+        context = ForwardContext.get_context()
+        if scaling_gate is not None:
+            if self.config.gate_scaling == "down":
+                gate_input = torch.cat((input_hidden_states, down), dim=-1)
+            elif self.config.gate_scaling == "add":
+                gate_input = input_hidden_states + hidden_states
+            else:
+                gate_input = torch.cat((input_hidden_states, hidden_states), dim=-1)
+            weights = scaling_gate(gate_input)
+            if self.config.max_gating:
+                if context.adapter_remaining_gating_scores:
+                    prev_remaining = context.adapter_remaining_gating_scores[-1]
+                else:
+                    prev_remaining = torch.tensor(8.0, device=weights.device, dtype=weights.dtype).expand_as(weights)
+                valid_mask = (prev_remaining - weights) >= 0.0
+                weights = weights * valid_mask.to(dtype=weights.dtype)
+                new_remaining = (prev_remaining - weights).clamp(min=0.0).detach()
+                context.adapter_remaining_gating_scores.append(new_remaining)   
+            
+            if not self.training and store_gating_func is not None:
+                store_gating_func(self.name, weights.squeeze(-1))
+            hidden_states = input_hidden_states + weights * hidden_states
+            
+        else:
+            hidden_states = hidden_states + input_hidden_states
 
         if self.original_ln_after:
             if layer_norm:

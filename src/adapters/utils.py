@@ -35,6 +35,7 @@ from huggingface_hub.utils import (
 )
 from requests.exceptions import HTTPError
 from transformers.utils import http_user_agent, is_remote_url
+from transformers.utils.hub import torch_cache_home
 
 from . import __version__
 from .context import ForwardContext
@@ -51,6 +52,8 @@ SAFE_HEAD_WEIGHTS_NAME = "model_head.safetensors"
 ADAPTERFUSION_CONFIG_NAME = "adapter_fusion_config.json"
 ADAPTERFUSION_WEIGHTS_NAME = "pytorch_model_adapter_fusion.bin"
 SAFE_ADAPTERFUSION_WEIGHTS_NAME = "model_adapter_fusion.safetensors"
+ADAPTERMOE_CONFIG_NAME = "adapter_moe_config.json"
+ADAPTERMOE_WEIGHTS_NAME = "pytorch_model_adapter_moe.bin"
 EMBEDDING_FILE = "embedding.pt"
 TOKENIZER_PATH = "tokenizer"
 SETUP_CONFIG_NAME = "adapter_setup.json"
