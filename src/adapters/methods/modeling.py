@@ -39,18 +39,19 @@ class Adapter(nn.Module):
     def __init__(
         self,
         adapter_name,
-        input_size,
+        input_shape,
         down_sample,
         config: BnConfig,
     ):
         super().__init__()
         self.name = adapter_name
-        self.input_size = input_size
+        self.input_size = input_shape
         self.config = config
         self.add_layer_norm_before = config["ln_before"]
         self.add_layer_norm_after = config["ln_after"]
         self.adapter_residual_before_ln = config["adapter_residual_before_ln"]
         self.use_gating = config["use_gating"]
+        self.gate_scaling = config["gate_scaling"]
 
         # Params related to input & output of adapter
         self.residual_before_ln = config["residual_before_ln"]
@@ -102,7 +103,7 @@ class Adapter(nn.Module):
         elif config["scaling"] == "learned":
             self.scaling = nn.Parameter(torch.ones(1))
         elif config["scaling"] == "channel":
-            self.scaling = nn.Parameter(torch.ones(input_size))
+            self.scaling = nn.Parameter(torch.ones(input_shape))
         else:
             raise ValueError("Unknown scaling type: {}".format(config["scaling"]))
 
@@ -117,6 +118,30 @@ class Adapter(nn.Module):
                 self.gate = nn.Linear(self.down_sample, 1)
             else:
                 self.gate = nn.Linear(self.input_size, 1)
+                
+        if self.gate_scaling:
+            if self.gate_scaling == "down":
+                input_shape = self.input_size + self.down_sample
+            elif self.gate_scaling == "add":
+                input_shape = self.input_size
+            else:
+                input_shape = self.input_size * 2
+                
+            print(f"[INFO] Adding scaling gate for {self.name} with input shape {input_shape}")    
+            act_fn = nn.Softplus
+            # act_fn = nn.Sigmoid
+            # self.adapter_scaling_gate = nn.Sequential(
+            #     nn.Linear(input_size, input_size // 2, bias=False),
+            #     nn.Softplus(),
+            #     nn.Linear(input_size // 2, input_size // 4, bias=False),
+            #     nn.Softplus(),
+            #     nn.Linear(input_size // 4, 1, bias=False),
+            #     nn.Softplus(),
+            # )
+            self.adapter_scaling_gate = nn.Sequential(
+                nn.Linear(input_shape, 1, bias=False),
+                act_fn(),
+            )
 
         self.dropout = nn.Dropout(p=config["dropout"])
 
@@ -349,18 +374,18 @@ class ParallelAdapter(Adapter):
         Returns:
             The modified hidden states.
         """
-        scaling_gate = kwargs.get("scaling_gate", None)
+        # scaling_gate = kwargs.get("scaling_gate", None)
         down = kwargs.get("down", None)
         store_gating_func = kwargs.get("store_gating_func", None)
         context = ForwardContext.get_context()
-        if scaling_gate is not None:
-            if self.config.gate_scaling == "down":
+        if self.gate_scaling:
+            if self.gate_scaling == "down":
                 gate_input = torch.cat((input_hidden_states, down), dim=-1)
-            elif self.config.gate_scaling == "add":
+            elif self.gate_scaling == "add":
                 gate_input = input_hidden_states + hidden_states
             else:
                 gate_input = torch.cat((input_hidden_states, hidden_states), dim=-1)
-            weights = scaling_gate(gate_input)
+            weights = self.adapter_scaling_gate(gate_input)
             if self.config.max_gating:
                 if context.adapter_remaining_gating_scores:
                     prev_remaining = context.adapter_remaining_gating_scores[-1]

@@ -102,29 +102,29 @@ class BottleneckLayer(ComposableAdapterLayerBase, nn.Module):
             adapter.train(self.training)  # make sure training mode is consistent
             self.adapters[adapter_name] = adapter
             
-            if getattr(adapter_config, "gate_scaling", False) and self.adapter_scaling_gate is None:
-                if adapter_config.gate_scaling == "down":
-                    input_size = self.model_config.hidden_size + self.model_config.hidden_size // reduction_factor
-                elif adapter_config.gate_scaling == "add":
-                    input_size = self.model_config.hidden_size
-                else:
-                    input_size = self.model_config.hidden_size * 2
+            # if getattr(adapter_config, "gate_scaling", False) and self.adapter_scaling_gate is None:
+            #     if adapter_config.gate_scaling == "down":
+            #         input_size = self.model_config.hidden_size + self.model_config.hidden_size // reduction_factor
+            #     elif adapter_config.gate_scaling == "add":
+            #         input_size = self.model_config.hidden_size
+            #     else:
+            #         input_size = self.model_config.hidden_size * 2
                     
-                act_fn = nn.Softplus
-                # act_fn = nn.Sigmoid
-                # self.adapter_scaling_gate = nn.Sequential(
-                #     nn.Linear(input_size, input_size // 2, bias=False),
-                #     nn.Softplus(),
-                #     nn.Linear(input_size // 2, input_size // 4, bias=False),
-                #     nn.Softplus(),
-                #     nn.Linear(input_size // 4, 1, bias=False),
-                #     nn.Softplus(),
-                # )
-                self.adapter_scaling_gate = nn.Sequential(
-                    nn.Linear(input_size, 1, bias=False),
-                    act_fn(),
-                )
-                self.adapter_scaling_gate.train(self.training)
+            #     act_fn = nn.Softplus
+            #     # act_fn = nn.Sigmoid
+            #     # self.adapter_scaling_gate = nn.Sequential(
+            #     #     nn.Linear(input_size, input_size // 2, bias=False),
+            #     #     nn.Softplus(),
+            #     #     nn.Linear(input_size // 2, input_size // 4, bias=False),
+            #     #     nn.Softplus(),
+            #     #     nn.Linear(input_size // 4, 1, bias=False),
+            #     #     nn.Softplus(),
+            #     # )
+            #     self.adapter_scaling_gate = nn.Sequential(
+            #         nn.Linear(input_size, 1, bias=False),
+            #         act_fn(),
+            #     )
+            #     self.adapter_scaling_gate.train(self.training)
                 
             return True
 
